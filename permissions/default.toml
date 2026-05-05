@@ -1,0 +1,17 @@
+"$schema" = "schemas/schema.json"
+
+[default]
+description = "Default permissions for the overlay plugin. Allows everything; tighten this in your app's capabilities if you only want to expose a subset of overlay operations to the frontend."
+permissions = [
+    "allow-is-supported",
+    "allow-attach",
+    "allow-detach",
+    "allow-is-attached",
+    "allow-create-panel",
+    "allow-close-panel",
+    "allow-set-panel-bounds",
+    "allow-set-panel-interactive",
+    "allow-set-panel-z-index",
+    "allow-post-panel-message",
+    "allow-ping-shell",
+]

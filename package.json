@@ -1,0 +1,33 @@
+{
+  "name": "@judehek/tauri-plugin-overlay",
+  "version": "0.1.0",
+  "description": "Tauri plugin bindings for overlay-engine — render WebView2 panels into running Windows games via DLL injection.",
+  "license": "MIT",
+  "repository": "github:judehek/tauri-plugin-overlay",
+  "type": "module",
+  "main": "./dist-js/index.cjs",
+  "module": "./dist-js/index.js",
+  "types": "./dist-js/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist-js/index.d.ts",
+      "import": "./dist-js/index.js",
+      "require": "./dist-js/index.cjs"
+    }
+  },
+  "files": [
+    "dist-js",
+    "guest-js",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "node build.mjs && tsc -p tsconfig.json --emitDeclarationOnly --declaration --outDir dist-js"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.0.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.21.5",
+    "typescript": "^5.4.0"
+  }
+}
