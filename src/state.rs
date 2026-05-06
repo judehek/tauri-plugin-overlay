@@ -27,6 +27,13 @@ use crate::{PanelOptions, Rect};
 pub struct OverlayConfig {
     pub dll_dir: Option<PathBuf>,
     pub static_dir: Option<PathBuf>,
+    /// Override for the WebView2 composition surface size, in
+    /// physical pixels. `None` lets the engine fall back to its
+    /// internal default. The engine stretches this surface to cover
+    /// the game window, so a small surface on a 1080p+ game looks
+    /// blurry; size to the user's primary monitor (or the game
+    /// window if known) for crisp panels.
+    pub surface_size: Option<(u32, u32)>,
     #[cfg(target_os = "windows")]
     pub extra_router: Option<axum::Router>,
 }
@@ -219,6 +226,9 @@ mod imp {
             }
             if let Some(router) = config.extra_router {
                 builder = builder.extra_router(router);
+            }
+            if let Some((w, h)) = config.surface_size {
+                builder = builder.surface_size(w, h);
             }
             let overlay = builder.build().await?;
             *guard = Some(overlay.clone());

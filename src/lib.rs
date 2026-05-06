@@ -114,6 +114,12 @@ pub const EVENT_NAME: &str = "plugin-overlay://event";
 type DirResolver<R> =
     Box<dyn for<'a> Fn(&'a AppHandle<R>) -> PathBuf + Send + Sync + 'static>;
 
+/// Resolves a `(width, height)` pair at plugin-setup time. Used for
+/// configuration that depends on the running app's environment
+/// (e.g. the user's primary monitor size for the WebView2 surface).
+type SizeResolver<R> =
+    Box<dyn for<'a> Fn(&'a AppHandle<R>) -> (u32, u32) + Send + Sync + 'static>;
+
 /// Plugin builder. Configure DLL + panel-asset locations, then call
 /// [`Builder::build`] to install the plugin into a `tauri::Builder`.
 ///
@@ -123,6 +129,7 @@ type DirResolver<R> =
 pub struct Builder<R: Runtime = tauri::Wry> {
     dll_dir_resolver: Option<DirResolver<R>>,
     static_dir_resolver: Option<DirResolver<R>>,
+    surface_size_resolver: Option<SizeResolver<R>>,
     #[cfg(target_os = "windows")]
     extra_router: Option<axum::Router>,
 }
@@ -132,6 +139,7 @@ impl<R: Runtime> Default for Builder<R> {
         Self {
             dll_dir_resolver: None,
             static_dir_resolver: None,
+            surface_size_resolver: None,
             #[cfg(target_os = "windows")]
             extra_router: None,
         }
@@ -173,6 +181,30 @@ impl<R: Runtime> Builder<R> {
         self
     }
 
+    /// Resolve the WebView2 composition surface size at plugin-setup
+    /// time. The returned `(width, height)` is the render-target the
+    /// engine creates for the overlay; it's stretched to cover the
+    /// game window, so undersizing it produces blurry panels on
+    /// high-resolution games. A reasonable default is the user's
+    /// primary monitor size:
+    ///
+    /// ```ignore
+    /// .with_surface_size_resolver(|app| {
+    ///     app.primary_monitor()
+    ///         .ok()
+    ///         .flatten()
+    ///         .map(|m| (m.size().width, m.size().height))
+    ///         .unwrap_or((1920, 1080))
+    /// })
+    /// ```
+    pub fn with_surface_size_resolver<F>(mut self, f: F) -> Self
+    where
+        F: for<'a> Fn(&'a AppHandle<R>) -> (u32, u32) + Send + Sync + 'static,
+    {
+        self.surface_size_resolver = Some(Box::new(f));
+        self
+    }
+
     /// Build the Tauri plugin. Returns a `TauriPlugin` you pass to
     /// `tauri::Builder::plugin(...)`.
     pub fn build(self) -> TauriPlugin<R> {
@@ -183,6 +215,7 @@ impl<R: Runtime> Builder<R> {
         let pending = Mutex::new(Some(PendingConfig::<R> {
             dll_dir_resolver: self.dll_dir_resolver,
             static_dir_resolver: self.static_dir_resolver,
+            surface_size_resolver: self.surface_size_resolver,
             #[cfg(target_os = "windows")]
             extra_router: self.extra_router,
         }));
@@ -213,9 +246,14 @@ impl<R: Runtime> Builder<R> {
                     .static_dir_resolver
                     .as_ref()
                     .map(|f| f(app_handle));
+                let surface_size = pending
+                    .surface_size_resolver
+                    .as_ref()
+                    .map(|f| f(app_handle));
                 let config = OverlayConfig {
                     dll_dir,
                     static_dir,
+                    surface_size,
                     #[cfg(target_os = "windows")]
                     extra_router: pending.extra_router,
                 };
@@ -229,6 +267,7 @@ impl<R: Runtime> Builder<R> {
 struct PendingConfig<R: Runtime> {
     dll_dir_resolver: Option<DirResolver<R>>,
     static_dir_resolver: Option<DirResolver<R>>,
+    surface_size_resolver: Option<SizeResolver<R>>,
     #[cfg(target_os = "windows")]
     extra_router: Option<axum::Router>,
 }
