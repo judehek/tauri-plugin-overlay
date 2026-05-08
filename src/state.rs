@@ -29,13 +29,33 @@ pub struct OverlayConfig {
     pub static_dir: Option<PathBuf>,
     /// Override for the WebView2 composition surface size, in
     /// physical pixels. `None` lets the engine fall back to its
-    /// internal default. The engine stretches this surface to cover
-    /// the game window, so a small surface on a 1080p+ game looks
-    /// blurry; size to the user's primary monitor (or the game
-    /// window if known) for crisp panels.
+    /// internal default. The engine draws this texture at native
+    /// pixel size at the position chosen by [`Self::surface_layout`];
+    /// for full-window overlays this should be sized to the user's
+    /// primary monitor (or the game window if known).
     pub surface_size: Option<(u32, u32)>,
+    /// Override for where the surface is composited inside the game
+    /// window. `None` keeps the engine's default (top-left at
+    /// native size, suitable for full-window surfaces). Set this to
+    /// a custom anchor / position / margin to draw the surface as a
+    /// sub-window panel — e.g. a phone-shaped surface on the right
+    /// side of the game window.
+    #[cfg(target_os = "windows")]
+    pub surface_layout: Option<overlay_engine::SurfaceLayout>,
     #[cfg(target_os = "windows")]
     pub extra_router: Option<axum::Router>,
+    /// JavaScript snippets injected via
+    /// `AddScriptToExecuteOnDocumentCreated` on every WebView2 attach.
+    /// Each script runs at the start of every document the WebView2
+    /// loads. Use this to install a host-controlled UI layer (e.g. a
+    /// draggable frame) that needs to survive top-frame navigations
+    /// away from the embedded shell.
+    #[cfg(target_os = "windows")]
+    pub document_created_scripts: Vec<String>,
+    /// Path WebView2 uses for its user-data folder (cookies / local
+    /// storage / cache). `None` lets WebView2 pick its
+    /// `<exe>.WebView2/EBWebView/` default.
+    pub user_data_folder: Option<PathBuf>,
 }
 
 /// Tauri-managed handle the plugin commands and consumer Rust code
@@ -105,6 +125,40 @@ impl OverlayPluginState {
 
     pub async fn ensure_built(&self) -> Result<()> {
         self.inner.ensure_built().await
+    }
+
+    /// Update the surface size used on the **next** `attach`. Has no
+    /// effect on the current attach if any (size is baked into the
+    /// composition stack at attach time). Pair with `detach` +
+    /// `attach` for an immediate effect.
+    pub async fn set_surface_size(&self, width: u32, height: u32) -> Result<()> {
+        self.inner.set_surface_size(width, height).await
+    }
+
+    /// Update the surface layout (`SetPosition` / `SetAnchor` /
+    /// `SetMargin`). Pushed to the asdf-overlay DLL via IPC if
+    /// currently attached (no composition rebuild), and remembered
+    /// for the next attach.
+    pub async fn set_surface_layout(
+        &self,
+        layout: overlay_engine::SurfaceLayout,
+    ) -> Result<()> {
+        self.inner.set_surface_layout(layout).await
+    }
+
+    /// Push only `SetMargin` to the DLL. Fast-path for per-frame drag
+    /// updates where anchor and position are unchanged; ~3x cheaper
+    /// than [`Self::set_surface_layout`].
+    pub async fn set_surface_margin(
+        &self,
+        margin: (
+            overlay_engine::PercentLength,
+            overlay_engine::PercentLength,
+            overlay_engine::PercentLength,
+            overlay_engine::PercentLength,
+        ),
+    ) -> Result<()> {
+        self.inner.set_surface_margin(margin).await
     }
 }
 
@@ -230,6 +284,15 @@ mod imp {
             if let Some((w, h)) = config.surface_size {
                 builder = builder.surface_size(w, h);
             }
+            if let Some(layout) = config.surface_layout {
+                builder = builder.surface_layout(layout);
+            }
+            for script in config.document_created_scripts {
+                builder = builder.document_created_script(script);
+            }
+            if let Some(path) = config.user_data_folder {
+                builder = builder.user_data_folder(path);
+            }
             let overlay = builder.build().await?;
             *guard = Some(overlay.clone());
             Ok(overlay)
@@ -327,6 +390,40 @@ mod imp {
         pub async fn ensure_built(&self) -> Result<()> {
             self.overlay().await?;
             Ok(())
+        }
+
+        pub async fn set_surface_size(&self, width: u32, height: u32) -> Result<()> {
+            // Lazy-build the Overlay so the new size sticks even if
+            // we haven't attached yet.
+            self.overlay().await?.set_surface_size(width, height);
+            Ok(())
+        }
+
+        pub async fn set_surface_layout(
+            &self,
+            layout: overlay_engine::SurfaceLayout,
+        ) -> Result<()> {
+            self.overlay()
+                .await?
+                .set_surface_layout(layout)
+                .await
+                .map_err(Into::into)
+        }
+
+        pub async fn set_surface_margin(
+            &self,
+            margin: (
+                overlay_engine::PercentLength,
+                overlay_engine::PercentLength,
+                overlay_engine::PercentLength,
+                overlay_engine::PercentLength,
+            ),
+        ) -> Result<()> {
+            self.overlay()
+                .await?
+                .set_surface_margin(margin)
+                .await
+                .map_err(Into::into)
         }
     }
 

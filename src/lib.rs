@@ -50,6 +50,12 @@ mod state;
 pub use error::{Error, Result};
 pub use state::{OverlayConfig, OverlayManagerExt, OverlayPluginState};
 
+// Re-export the engine's surface-layout types so consumers don't
+// have to add `overlay-engine` as a direct dep just to build a
+// layout passed to `with_surface_layout_resolver`.
+#[cfg(target_os = "windows")]
+pub use overlay_engine::{PercentLength, SurfaceLayout};
+
 /// Pixel-space rectangle on the WebView2 surface. Cross-platform so
 /// consumer code (e.g. plugin commands, Rust callers) can construct
 /// it without conditionally importing `overlay_engine::Rect`.
@@ -120,6 +126,19 @@ type DirResolver<R> =
 type SizeResolver<R> =
     Box<dyn for<'a> Fn(&'a AppHandle<R>) -> (u32, u32) + Send + Sync + 'static>;
 
+/// Resolves a [`SurfaceLayout`] at plugin-setup time. Returning
+/// `None` keeps the engine's default top-left layout.
+///
+/// [`SurfaceLayout`]: overlay_engine::SurfaceLayout
+#[cfg(target_os = "windows")]
+type LayoutResolver<R> = Box<
+    dyn for<'a> Fn(&'a AppHandle<R>) -> Option<overlay_engine::SurfaceLayout>
+        + Send
+        + Sync
+        + 'static,
+>;
+
+
 /// Plugin builder. Configure DLL + panel-asset locations, then call
 /// [`Builder::build`] to install the plugin into a `tauri::Builder`.
 ///
@@ -129,9 +148,14 @@ type SizeResolver<R> =
 pub struct Builder<R: Runtime = tauri::Wry> {
     dll_dir_resolver: Option<DirResolver<R>>,
     static_dir_resolver: Option<DirResolver<R>>,
+    user_data_folder_resolver: Option<DirResolver<R>>,
     surface_size_resolver: Option<SizeResolver<R>>,
     #[cfg(target_os = "windows")]
+    surface_layout_resolver: Option<LayoutResolver<R>>,
+    #[cfg(target_os = "windows")]
     extra_router: Option<axum::Router>,
+    #[cfg(target_os = "windows")]
+    document_created_scripts: Vec<String>,
 }
 
 impl<R: Runtime> Default for Builder<R> {
@@ -139,9 +163,14 @@ impl<R: Runtime> Default for Builder<R> {
         Self {
             dll_dir_resolver: None,
             static_dir_resolver: None,
+            user_data_folder_resolver: None,
             surface_size_resolver: None,
             #[cfg(target_os = "windows")]
+            surface_layout_resolver: None,
+            #[cfg(target_os = "windows")]
             extra_router: None,
+            #[cfg(target_os = "windows")]
+            document_created_scripts: Vec::new(),
         }
     }
 }
@@ -169,6 +198,21 @@ impl<R: Runtime> Builder<R> {
         F: for<'a> Fn(&'a AppHandle<R>) -> PathBuf + Send + Sync + 'static,
     {
         self.static_dir_resolver = Some(Box::new(f));
+        self
+    }
+
+    /// Resolve the WebView2 user-data folder at plugin-setup time.
+    /// `None` from the resolver (i.e. omitting this call) keeps
+    /// WebView2's default `<exe>.WebView2/EBWebView/` next to the host
+    /// process. Set this to a path you also configure for any other
+    /// WebView2 in the host (e.g. the Tauri main window via
+    /// `WEBVIEW2_USER_DATA_FOLDER`) so a sign-in flow in one webview
+    /// is visible to the in-game overlay.
+    pub fn with_user_data_folder_resolver<F>(mut self, f: F) -> Self
+    where
+        F: for<'a> Fn(&'a AppHandle<R>) -> PathBuf + Send + Sync + 'static,
+    {
+        self.user_data_folder_resolver = Some(Box::new(f));
         self
     }
 
@@ -205,6 +249,61 @@ impl<R: Runtime> Builder<R> {
         self
     }
 
+    /// Resolve where in the game window the overlay surface should
+    /// be composited. Default is top-left at native size, which is
+    /// the right answer for surfaces sized to cover the whole game
+    /// window. Use this for sub-window panels (a phone-shaped HUD
+    /// on the right edge, a corner banner, etc.).
+    ///
+    /// ```ignore
+    /// use overlay_engine::{PercentLength, SurfaceLayout};
+    ///
+    /// .with_surface_layout_resolver(|_app| {
+    ///     // Anchor the right-center of the surface to the
+    ///     // right-center of the game window, with a 24 px
+    ///     // right margin.
+    ///     Some(SurfaceLayout {
+    ///         position: (PercentLength::Percent(1.0), PercentLength::Percent(0.5)),
+    ///         anchor:   (PercentLength::Percent(1.0), PercentLength::Percent(0.5)),
+    ///         margin:   (
+    ///             PercentLength::ZERO,
+    ///             PercentLength::Length(24.0),
+    ///             PercentLength::ZERO,
+    ///             PercentLength::ZERO,
+    ///         ),
+    ///     })
+    /// })
+    /// ```
+    #[cfg(target_os = "windows")]
+    pub fn with_surface_layout_resolver<F>(mut self, f: F) -> Self
+    where
+        F: for<'a> Fn(&'a AppHandle<R>) -> Option<overlay_engine::SurfaceLayout>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.surface_layout_resolver = Some(Box::new(f));
+        self
+    }
+
+    /// Inject a JavaScript snippet into every document the WebView2
+    /// loads, via WebView2's `AddScriptToExecuteOnDocumentCreated`.
+    /// The script runs at the start of every document, before the
+    /// page's own scripts. Call multiple times to register multiple
+    /// scripts; they execute in registration order.
+    ///
+    /// Useful for installing a host-controlled UI layer (e.g. a
+    /// draggable frame around panel content) that survives top-frame
+    /// navigations away from the embedded shell page. The script
+    /// communicates with the host via `chrome.webview.postMessage`,
+    /// which arrives on the host as a regular overlay panel-message
+    /// event.
+    #[cfg(target_os = "windows")]
+    pub fn with_document_created_script(mut self, script: impl Into<String>) -> Self {
+        self.document_created_scripts.push(script.into());
+        self
+    }
+
     /// Build the Tauri plugin. Returns a `TauriPlugin` you pass to
     /// `tauri::Builder::plugin(...)`.
     pub fn build(self) -> TauriPlugin<R> {
@@ -215,9 +314,14 @@ impl<R: Runtime> Builder<R> {
         let pending = Mutex::new(Some(PendingConfig::<R> {
             dll_dir_resolver: self.dll_dir_resolver,
             static_dir_resolver: self.static_dir_resolver,
+            user_data_folder_resolver: self.user_data_folder_resolver,
             surface_size_resolver: self.surface_size_resolver,
             #[cfg(target_os = "windows")]
+            surface_layout_resolver: self.surface_layout_resolver,
+            #[cfg(target_os = "windows")]
             extra_router: self.extra_router,
+            #[cfg(target_os = "windows")]
+            document_created_scripts: self.document_created_scripts,
         }));
 
         tauri::plugin::Builder::<R>::new("overlay")
@@ -246,16 +350,30 @@ impl<R: Runtime> Builder<R> {
                     .static_dir_resolver
                     .as_ref()
                     .map(|f| f(app_handle));
+                let user_data_folder = pending
+                    .user_data_folder_resolver
+                    .as_ref()
+                    .map(|f| f(app_handle));
                 let surface_size = pending
                     .surface_size_resolver
                     .as_ref()
                     .map(|f| f(app_handle));
+                #[cfg(target_os = "windows")]
+                let surface_layout = pending
+                    .surface_layout_resolver
+                    .as_ref()
+                    .and_then(|f| f(app_handle));
                 let config = OverlayConfig {
                     dll_dir,
                     static_dir,
                     surface_size,
+                    user_data_folder,
+                    #[cfg(target_os = "windows")]
+                    surface_layout,
                     #[cfg(target_os = "windows")]
                     extra_router: pending.extra_router,
+                    #[cfg(target_os = "windows")]
+                    document_created_scripts: pending.document_created_scripts,
                 };
                 app.manage(OverlayPluginState::new(config));
                 Ok(())
@@ -267,9 +385,14 @@ impl<R: Runtime> Builder<R> {
 struct PendingConfig<R: Runtime> {
     dll_dir_resolver: Option<DirResolver<R>>,
     static_dir_resolver: Option<DirResolver<R>>,
+    user_data_folder_resolver: Option<DirResolver<R>>,
     surface_size_resolver: Option<SizeResolver<R>>,
     #[cfg(target_os = "windows")]
+    surface_layout_resolver: Option<LayoutResolver<R>>,
+    #[cfg(target_os = "windows")]
     extra_router: Option<axum::Router>,
+    #[cfg(target_os = "windows")]
+    document_created_scripts: Vec<String>,
 }
 
 /// Convenience function so callers can write
