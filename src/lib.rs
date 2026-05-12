@@ -138,6 +138,14 @@ type LayoutResolver<R> = Box<
         + 'static,
 >;
 
+/// Resolves an extra `axum::Router` at plugin-setup time. Use this
+/// when the routes need an `AppHandle` to construct — e.g. routes
+/// that serve Tauri's embedded `frontendDist` blob via
+/// `app.asset_resolver()` to the injected WebView2.
+#[cfg(target_os = "windows")]
+type RouterResolver<R> =
+    Box<dyn for<'a> Fn(&'a AppHandle<R>) -> axum::Router + Send + Sync + 'static>;
+
 
 /// Plugin builder. Configure DLL + panel-asset locations, then call
 /// [`Builder::build`] to install the plugin into a `tauri::Builder`.
@@ -155,6 +163,8 @@ pub struct Builder<R: Runtime = tauri::Wry> {
     #[cfg(target_os = "windows")]
     extra_router: Option<axum::Router>,
     #[cfg(target_os = "windows")]
+    extra_router_resolver: Option<RouterResolver<R>>,
+    #[cfg(target_os = "windows")]
     document_created_scripts: Vec<String>,
 }
 
@@ -169,6 +179,8 @@ impl<R: Runtime> Default for Builder<R> {
             surface_layout_resolver: None,
             #[cfg(target_os = "windows")]
             extra_router: None,
+            #[cfg(target_os = "windows")]
+            extra_router_resolver: None,
             #[cfg(target_os = "windows")]
             document_created_scripts: Vec::new(),
         }
@@ -222,6 +234,22 @@ impl<R: Runtime> Builder<R> {
     #[cfg(target_os = "windows")]
     pub fn with_extra_router(mut self, router: axum::Router) -> Self {
         self.extra_router = Some(router);
+        self
+    }
+
+    /// Resolve an extra `axum::Router` at plugin-setup time, when an
+    /// `AppHandle` is available. Use this (rather than
+    /// [`Self::with_extra_router`]) when the router's handlers need to
+    /// hold an `AppHandle` — e.g. to serve Tauri's embedded
+    /// `frontendDist` files to the injected WebView2 via
+    /// `app.asset_resolver()`. If both this and `with_extra_router`
+    /// are set, the resolver wins.
+    #[cfg(target_os = "windows")]
+    pub fn with_extra_router_resolver<F>(mut self, f: F) -> Self
+    where
+        F: for<'a> Fn(&'a AppHandle<R>) -> axum::Router + Send + Sync + 'static,
+    {
+        self.extra_router_resolver = Some(Box::new(f));
         self
     }
 
@@ -321,6 +349,8 @@ impl<R: Runtime> Builder<R> {
             #[cfg(target_os = "windows")]
             extra_router: self.extra_router,
             #[cfg(target_os = "windows")]
+            extra_router_resolver: self.extra_router_resolver,
+            #[cfg(target_os = "windows")]
             document_created_scripts: self.document_created_scripts,
         }));
 
@@ -363,6 +393,12 @@ impl<R: Runtime> Builder<R> {
                     .surface_layout_resolver
                     .as_ref()
                     .and_then(|f| f(app_handle));
+                #[cfg(target_os = "windows")]
+                let extra_router = pending
+                    .extra_router_resolver
+                    .as_ref()
+                    .map(|f| f(app_handle))
+                    .or(pending.extra_router);
                 let config = OverlayConfig {
                     dll_dir,
                     static_dir,
@@ -371,7 +407,7 @@ impl<R: Runtime> Builder<R> {
                     #[cfg(target_os = "windows")]
                     surface_layout,
                     #[cfg(target_os = "windows")]
-                    extra_router: pending.extra_router,
+                    extra_router,
                     #[cfg(target_os = "windows")]
                     document_created_scripts: pending.document_created_scripts,
                 };
@@ -391,6 +427,8 @@ struct PendingConfig<R: Runtime> {
     surface_layout_resolver: Option<LayoutResolver<R>>,
     #[cfg(target_os = "windows")]
     extra_router: Option<axum::Router>,
+    #[cfg(target_os = "windows")]
+    extra_router_resolver: Option<RouterResolver<R>>,
     #[cfg(target_os = "windows")]
     document_created_scripts: Vec<String>,
 }
